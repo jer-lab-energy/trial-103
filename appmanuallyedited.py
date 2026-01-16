@@ -901,13 +901,27 @@ def safe_read_geojson(uploaded_file):
             kml_name = next((n for n in kml_files if n.lower().endswith("doc.kml")), kml_files[0])
             return z.read(kml_name)
 
-    def _walk_fastkml_features(feat):
-        # fastkml objects can be nested: Document -> Folder -> Placemark
-        if hasattr(feat, "features"):
-            for sub in feat.features():
-                yield from _walk_fastkml_features(sub)
-        else:
-            yield feat
+
+def _walk_fastkml_features(feat):
+    """
+    fastkml compatibility:
+    - some versions use feat.features() (callable)
+    - some versions store children in feat.features (list)
+    """
+    children = None
+
+    if hasattr(feat, "features"):
+        children = getattr(feat, "features")
+
+        # If it's a function -> call it
+        if callable(children):
+            children = children()
+
+    if children:
+        for sub in children:
+            yield from _walk_fastkml_features(sub)
+    else:
+        yield feat
 
     def _kml_bytes_to_gdf(kml_bytes: bytes) -> gpd.GeoDataFrame:
         doc = fastkml_kml.KML()
