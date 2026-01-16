@@ -1958,85 +1958,6 @@ def add_layer_selector(map_obj):
     except Exception:
         pass
 
-
-# --- Export helper: single map ---
-def capture_single_map_png(map_obj, height_px: int = 800, executable_path: str = None, device_scale: int = 2, width_px: int = 1400):
-    """Render a single map HTML into a PNG using pyppeteer."""
-    try:
-        import asyncio
-        import tempfile
-        from pyppeteer import launch
-    except ImportError:
-        st.error("PNG export requires 'pyppeteer' (pip install pyppeteer).")
-        return None
-
-    map_html = map_obj.get_root().render()
-    html_doc = f"""
-    <html>
-      <head>
-        <meta charset="utf-8" />
-        <style>
-          html, body {{ margin: 0; padding: 0; background: #ffffff; }}
-          .map-wrap {{ width: {width_px}px; height: {height_px}px; margin: 0; }}
-          .folium-map, iframe {{ width: 100%; height: 100%; }}
-          /* Hide Leaflet/leafmap controls for export only */
-          .leaflet-control-container,
-          .leaflet-top, .leaflet-bottom,
-          .leaflet-control,
-          .leafmap-toolbar,
-          .leafmap-toolbar-container,
-          .leafmap-control,
-          .leafmap-toolbar-left,
-          .leafmap-toolbar-right,
-          .leaflet-control-layers {{ display: none !important; }}
-        </style>
-      </head>
-      <body>
-        <div class="map-wrap">{map_html}</div>
-      </body>
-    </html>
-    """
-
-    async def _shot(html_path: str):
-        launch_kwargs = {
-            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-            "handleSIGINT": False,
-            "handleSIGTERM": False,
-            "handleSIGHUP": False,
-        }
-        if executable_path:
-            launch_kwargs["executablePath"] = executable_path
-        browser = await launch(**launch_kwargs)
-        page = await browser.newPage()
-        await page.setViewport({"width": width_px, "height": height_px, "deviceScaleFactor": device_scale})
-        await page.goto(f"file:///{html_path}", waitUntil="networkidle0")
-        try:
-            await page.waitForSelector(".leaflet-tile-loaded", timeout=8000)
-        except Exception:
-            await asyncio.sleep(2)
-        await asyncio.sleep(2)
-        png = await page.screenshot(fullPage=True)
-        await browser.close()
-        return png
-
-    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
-        f.write(html_doc)
-        html_path = f.name
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    try:
-        png_bytes = loop.run_until_complete(_shot(html_path))
-    finally:
-        loop.close()
-        try:
-            os.remove(html_path)
-        except OSError:
-            pass
-
-    return png_bytes
-
-
 # --- Prepare data ---
 ensure_base_state()
 df = None
@@ -2080,91 +2001,63 @@ with header_cols[3]:
     st.toggle("Export mode", value=st.session_state.get("export_mode_global", False), key="export_mode_global")
 
 export_mode = st.session_state.get("export_mode_global", False)
-exe_path = None
-if export_mode:
-    default_browser_path = r"C:\Program Files\Google\Chrome\Application\chrome.exe"
-    browser_path = st.text_input(
-        "Chrome/Edge executable (optional, avoids pyppeteer download)",
-        value=st.session_state.get("browser_path", default_browser_path),
-    )
-    st.session_state["browser_path"] = browser_path
-    exe_path = browser_path if browser_path and os.path.exists(browser_path) else None
-    if not HAS_ST_FOLIUM:
-        st.info("Install streamlit-folium to capture the current pan/zoom for export.")
+
+
+def export_map_as_html(map_obj) -> bytes:
+    return map_obj.get_root().render().encode("utf-8")
+
 
 # --- Map grid ---
 map_count = st.session_state.map_count
 cols_per_row = cols_for_count(map_count)
 default_height = calc_map_height(map_count)
+
 map_idx = 0
 rows = (map_count + cols_per_row - 1) // cols_per_row
+
 for _ in range(rows):
     row_cols = st.columns(cols_per_row)
     for col in row_cols:
         if map_idx >= map_count:
             break
+
         with col:
             map_height = st.session_state.get(map_key("map_height", map_idx), default_height)
             m = render_single_map(map_idx, df, geojson_layers)
-            png_cache_key = map_key("cached_png", map_idx)
-            prev_height = st.session_state.get(map_key("prev_height", map_idx))
-            if prev_height != map_height:
-                st.session_state.pop(png_cache_key, None)
-            st.session_state[map_key("prev_height", map_idx)] = map_height
-            map_state = None
-            view_changed = False
-            # kmz types not used for input anymore; legend derives from entries in render_single_map
+
+            # Render map
             if export_mode and HAS_ST_FOLIUM:
                 map_state = st_folium(m, height=map_height, width="100%", key=f"map_render_{map_idx}")
                 if map_state:
-                    prev_zoom = st.session_state.get(map_key("map_zoom", map_idx))
-                    prev_lat = st.session_state.get(map_key("center_lat", map_idx))
-                    prev_lon = st.session_state.get(map_key("center_lon", map_idx))
-                    if map_state.get("zoom") and map_state["zoom"] != prev_zoom:
+                    if map_state.get("zoom") is not None:
                         st.session_state[map_key("map_zoom", map_idx)] = map_state["zoom"]
-                        view_changed = True
                     if map_state.get("center"):
-                        new_lat = map_state["center"]["lat"]
-                        new_lon = map_state["center"]["lng"]
-                        if new_lat != prev_lat or new_lon != prev_lon:
-                            st.session_state[map_key("center_lat", map_idx)] = new_lat
-                            st.session_state[map_key("center_lon", map_idx)] = new_lon
-                            view_changed = True
-                if view_changed:
-                    st.session_state.pop(png_cache_key, None)
+                        st.session_state[map_key("center_lat", map_idx)] = map_state["center"]["lat"]
+                        st.session_state[map_key("center_lon", map_idx)] = map_state["center"]["lng"]
             else:
                 m.to_streamlit(height=map_height)
-                st.session_state.pop(png_cache_key, None)
+
+            # Map name (NO empty label)
             st.text_input(
-                "",
+                "Map name",
                 key=map_key("name", map_idx),
                 value=get_map_name(map_idx),
                 label_visibility="collapsed",
             )
+
+            # HTML export (Cloud-safe)
             if export_mode:
-                if not HAS_ST_FOLIUM:
-                    st.info("Export mode requires streamlit-folium to capture the map view.")
-                else:
-                    if st.session_state.get(png_cache_key) is None:
-                        try:
-                            fresh_map = render_single_map(map_idx, df, geojson_layers)
-                            png_bytes = capture_single_map_png(fresh_map, height_px=map_height, executable_path=exe_path)
-                            if png_bytes:
-                                st.session_state[png_cache_key] = png_bytes
-                        except Exception as e:
-                            st.error(f"Could not render {get_map_name(map_idx)}: {e}")
-                    png_bytes = st.session_state.get(png_cache_key)
-                    if png_bytes:
-                        st.download_button(
-                            f"Download PNG ({get_map_name(map_idx)})",
-                            data=png_bytes,
-                            file_name=f"{get_map_name(map_idx).replace(' ', '_').lower()}.png",
-                            mime="image/png",
-                            key=map_key("download_png", map_idx),
-                        )
-                    else:
-                        st.caption("Adjust the map; the current view will be captured for download.")
+                html_bytes = export_map_as_html(m)
+                st.download_button(
+                    f"Download HTML ({get_map_name(map_idx)})",
+                    data=html_bytes,
+                    file_name=f"{get_map_name(map_idx).replace(' ', '_').lower()}.html",
+                    mime="text/html",
+                    key=map_key("download_html", map_idx),
+                )
+
         map_idx += 1
+
 
 # --- Data preview for all maps ---
 if filtered_dfs:
