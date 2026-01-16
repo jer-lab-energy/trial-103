@@ -6,4 +6,8 @@ streamlit-folium
 shapely
 fastkml
 pyppeteer
+folium
+numpy
+Pillow
+
 
