@@ -953,13 +953,27 @@ def safe_read_geojson(uploaded_file):
     name = (uploaded_file.name or "").lower()
 
     try:
+
         if name.endswith(".kmz"):
             kml_bytes = _extract_kml_bytes_from_kmz(uploaded_file)
             gdf = _kml_bytes_to_gdf(kml_bytes)
+            if gdf is not None and not gdf.empty:
+                gdf["__geom_base"] = gdf.geometry.geom_type.replace({
+                    "MultiPoint": "Point",
+                    "MultiLineString": "LineString",
+                    "MultiPolygon": "Polygon",
+                })
+
 
         elif name.endswith(".kml"):
             kml_bytes = uploaded_file.getvalue()
             gdf = _kml_bytes_to_gdf(kml_bytes)
+            if gdf is not None and not gdf.empty:
+                gdf["__geom_base"] = gdf.geometry.geom_type.replace({
+                    "MultiPoint": "Point",
+                    "MultiLineString": "LineString",
+                    "MultiPolygon": "Polygon",
+                })
 
         else:
             gdf = gpd.read_file(uploaded_file)
@@ -1608,6 +1622,25 @@ def render_map_controls(map_idx: int, df: pd.DataFrame, geo_layers):
             has_points = bool(layer_geom_types & {"Point", "MultiPoint"})
             has_polys = bool(layer_geom_types & {"Polygon", "MultiPolygon"})
             has_lines = bool(layer_geom_types & {"LineString", "MultiLineString"})
+            st.markdown("Show geometry types")
+            if has_points:
+                layer_settings["show_points"] = st.checkbox(
+                    "Show points",
+                    value=layer_settings.get("show_points", True),
+                    key=map_key(f"kmz_show_points_{selected_kmz}", map_idx),
+                )
+            if has_lines:
+                layer_settings["show_lines"] = st.checkbox(
+                    "Show lines",
+                    value=layer_settings.get("show_lines", True),
+                    key=map_key(f"kmz_show_lines_{selected_kmz}", map_idx),
+                )
+            if has_polys:
+                layer_settings["show_polygons"] = st.checkbox(
+                    "Show polygons",
+                    value=layer_settings.get("show_polygons", True),
+                    key=map_key(f"kmz_show_polys_{selected_kmz}", map_idx),
+                )
 
             if has_lines:
                 layer_settings["weight"] = st.slider("Line weight", 1, 10, int(layer_settings.get("weight", 2)), key=map_key(f"kmz_weight_{selected_kmz}", map_idx))
@@ -1771,19 +1804,39 @@ def render_single_map(map_idx: int, df: pd.DataFrame, geo_layers):
             fill_opacity = settings.get("fill_opacity", 0.6)
 
             gdf_all = layer["gdf"]
-            point_mask = gdf_all.geometry.geom_type.isin(["Point", "MultiPoint"])
-            gdf_points = gdf_all[point_mask]
-            gdf_non_points = gdf_all[~point_mask]
+            
+            if "__geom_base" in gdf_all.columns:
+                base = gdf_all["__geom_base"]
+            else:
+                base = gdf_all.geometry.geom_type.replace({
+                    "MultiPoint": "Point",
+                    "MultiLineString": "LineString",
+                    "MultiPolygon": "Polygon",
+                })
+            
+            show_points = settings.get("show_points", True)
+            show_lines = settings.get("show_lines", True)
+            show_polys = settings.get("show_polygons", True)
+            
+            gdf_points = gdf_all[(base == "Point")] if show_points else gdf_all.iloc[0:0]
+            gdf_lines  = gdf_all[(base == "LineString")] if show_lines else gdf_all.iloc[0:0]
+            gdf_polys  = gdf_all[(base == "Polygon")] if show_polys else gdf_all.iloc[0:0]
 
-            # Lines/Polygons with per-layer color
-            if not gdf_non_points.empty:
+            
+            # Lines
+            if not gdf_lines.empty:
+                style_kwargs = {"color": layer_color, "weight": weight}
+                m.add_gdf(gdf_lines, layer_name=f"{layer['name']} (Lines)", zoom_to_layer=False, style=style_kwargs)
+            
+            # Polygons
+            if not gdf_polys.empty:
                 style_kwargs = {
                     "color": layer_color,
                     "fillColor": layer_color,
                     "fillOpacity": fill_opacity,
                     "weight": weight,
                 }
-                m.add_gdf(gdf_non_points, layer_name=layer["name"], zoom_to_layer=False, style=style_kwargs)
+                m.add_gdf(gdf_polys, layer_name=f"{layer['name']} (Polygons)", zoom_to_layer=False, style=style_kwargs)
 
             # Points with per-layer marker styling
             if not gdf_points.empty:
