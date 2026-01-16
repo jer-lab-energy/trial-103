@@ -9,6 +9,7 @@ try:
 except ImportError:
     HAS_ST_FOLIUM = False
 from shapely.geometry import Point
+from label_positions import compute_label_positions
 import base64
 from io import BytesIO
 
@@ -338,66 +339,59 @@ def extract_kmz_styles(gdf, max_entries=2000, color_override=None):
 
     return entries
 
+from fastkml import kml
+import zipfile
 import base64
 
-from io import BytesIO
-import zipfile
-
-
-from fastkml import kml
-
-def extract_kml_styles_from_kml_path(kml_path):
+def extract_kml_styles_from_kmz(kmz_path):
     """
-    Reads a KML file from disk and extracts styles into:
+    Reads KMZ, parses KML, extracts styles into a dict:
     { style_id : { 'icon_href', 'poly_color', 'line_color', 'line_width' } }
     """
     styles = {}
 
-    try:
-        with open(kml_path, "rb") as f:
-            raw = f.read()
-        kml_text = raw.decode("utf-8", errors="replace")
-    except Exception:
-        return styles
+    with zipfile.ZipFile(kmz_path, "r") as z:
+        # find KML file inside KMZ
+        kml_name = [n for n in z.namelist() if n.lower().endswith(".kml")][0]
+        kml_data = z.read(kml_name).decode("utf-8")
 
     doc = kml.KML()
-    try:
-        doc.from_string(kml_text)
-    except Exception:
-        try:
-            doc.from_string(kml_text.encode("utf-8", errors="replace"))
-        except Exception:
-            return styles
+    doc.from_string(kml_data)
 
     for feature in doc.features():
         for s in feature.styles():
-            sid = getattr(s, "id", None)
-            if not sid:
-                continue
+            sid = s.id
 
             poly_color = None
             line_color = None
             line_width = 2
             icon_href = None
 
-            if getattr(s, "polystyle", None) and getattr(s.polystyle, "color", None):
-                kml_col = s.polystyle.color  # aabbggrr
-                if isinstance(kml_col, str) and len(kml_col) >= 8:
-                    aa, bb, gg, rr = kml_col[0:2], kml_col[2:4], kml_col[4:6], kml_col[6:8]
+            if s.polystyle:
+                # KML color format: aabbggrr → convert to CSS #rrggbbaa
+                kml_col = s.polystyle.color
+                if kml_col:
+                    rr = kml_col[6:8]
+                    gg = kml_col[4:6]
+                    bb = kml_col[2:4]
+                    aa = kml_col[0:2]
                     poly_color = f"#{rr}{gg}{bb}{aa}"
 
-            if getattr(s, "linestyle", None) and getattr(s.linestyle, "color", None):
+            if s.linestyle:
                 kml_col = s.linestyle.color
-                if isinstance(kml_col, str) and len(kml_col) >= 8:
-                    aa, bb, gg, rr = kml_col[0:2], kml_col[2:4], kml_col[4:6], kml_col[6:8]
+                if kml_col:
+                    rr = kml_col[6:8]
+                    gg = kml_col[4:6]
+                    bb = kml_col[2:4]
+                    aa = kml_col[0:2]
                     line_color = f"#{rr}{gg}{bb}{aa}"
-                if getattr(s.linestyle, "width", None) is not None:
+                if s.linestyle.width:
                     line_width = s.linestyle.width
 
-            if getattr(s, "iconstyle", None) and getattr(s.iconstyle, "icon", None) and getattr(s.iconstyle.icon, "href", None):
+            if s.iconstyle and s.iconstyle.icon and s.iconstyle.icon.href:
                 icon_href = s.iconstyle.icon.href
 
-            styles[str(sid)] = {
+            styles[sid] = {
                 "poly_color": poly_color,
                 "line_color": line_color,
                 "line_width": line_width,
@@ -406,31 +400,28 @@ def extract_kml_styles_from_kml_path(kml_path):
 
     return styles
 
-
-def attach_kml_styles_to_gdf(gdf, kml_path):
-    styles = extract_kml_styles_from_kml_path(kml_path)  # ✅ use KML styles
+def attach_kml_styles_to_gdf(gdf, kmz_path):
+    styles = extract_kml_styles_from_kmz(kmz_path)
 
     if "styleUrl" not in gdf.columns:
-        return gdf
+        return gdf  # nothing to map
 
     def apply(row):
-        raw = str(row.get("styleUrl", "") or "")
-        sid = raw.split("#")[-1]  # handles "#id" and full URLs
+        sid = str(row.get("styleUrl", "")).replace("#", "")
         s = styles.get(sid, {})
 
-        if s.get("poly_color"):
+        if "poly_color" in s:
             row["fill"] = s["poly_color"]
-        if s.get("line_color"):
+        if "line_color" in s:
             row["stroke"] = s["line_color"]
-        if s.get("line_width") is not None:
+        if "line_width" in s:
             row["stroke-width"] = s["line_width"]
-        if s.get("icon_href"):
+        if "icon_href" in s:
             row["icon_href"] = s["icon_href"]
 
         return row
 
     return gdf.apply(apply, axis=1)
-
 
 # --- Mini Symbol Generator --- #
 import shapely
@@ -598,6 +589,7 @@ def render_point_marker(map_obj, lat, lon, settings):
             icon=folium.DivIcon(html=html, icon_size=(size, size), icon_anchor=(radius, size)),
         ).add_to(map_obj)
     elif shape == "Custom Image" and settings.get("custom_icon_bytes"):
+        import base64
         b64_icon = base64.b64encode(settings["custom_icon_bytes"]).decode("ascii")
         data_url = f"data:image/png;base64,{b64_icon}"
         icon_px = int(settings.get("custom_icon_size", 24))
@@ -810,22 +802,21 @@ def _read_kmz_to_path(uploaded_file):
     """Extract the first KML inside a KMZ upload to a temp path and return it."""
     import tempfile
     import zipfile
-    
+
     if not uploaded_file or not uploaded_file.name.lower().endswith(".kmz"):
         return None
 
     try:
-        data = uploaded_file.getvalue()  # ✅ don't consume cursor
-        with zipfile.ZipFile(BytesIO(data)) as zf:
-            kml_candidates = [n for n in zf.namelist() if n.lower().endswith(".kml")]
-            if not kml_candidates:
-                return None
-            kml_name = kml_candidates[0]
-
-            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
-            with open(tmp.name, "wb") as f:
-                f.write(zf.read(kml_name))
-            return tmp.name
+        data = uploaded_file.read()
+        zf = zipfile.ZipFile(BytesIO(data))
+        kml_candidates = [n for n in zf.namelist() if n.lower().endswith(".kml")]
+        if not kml_candidates:
+            return None
+        kml_name = kml_candidates[0]
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
+        with tmp as f:
+            f.write(zf.read(kml_name))
+        return tmp.name
     except Exception:
         return None
 
@@ -1968,87 +1959,82 @@ def add_layer_selector(map_obj):
         pass
 
 
-def export_map_as_html(map_obj) -> bytes:
-    html = map_obj.get_root().render()
-    return html.encode("utf-8")
+# --- Export helper: single map ---
+def capture_single_map_png(map_obj, height_px: int = 800, executable_path: str = None, device_scale: int = 2, width_px: int = 1400):
+    """Render a single map HTML into a PNG using pyppeteer."""
+    try:
+        import asyncio
+        import tempfile
+        from pyppeteer import launch
+    except ImportError:
+        st.error("PNG export requires 'pyppeteer' (pip install pyppeteer).")
+        return None
 
+    map_html = map_obj.get_root().render()
+    html_doc = f"""
+    <html>
+      <head>
+        <meta charset="utf-8" />
+        <style>
+          html, body {{ margin: 0; padding: 0; background: #ffffff; }}
+          .map-wrap {{ width: {width_px}px; height: {height_px}px; margin: 0; }}
+          .folium-map, iframe {{ width: 100%; height: 100%; }}
+          /* Hide Leaflet/leafmap controls for export only */
+          .leaflet-control-container,
+          .leaflet-top, .leaflet-bottom,
+          .leaflet-control,
+          .leafmap-toolbar,
+          .leafmap-toolbar-container,
+          .leafmap-control,
+          .leafmap-toolbar-left,
+          .leafmap-toolbar-right,
+          .leaflet-control-layers {{ display: none !important; }}
+        </style>
+      </head>
+      <body>
+        <div class="map-wrap">{map_html}</div>
+      </body>
+    </html>
+    """
 
-# # --- Export helper: single map ---
-# def capture_single_map_png(map_obj, height_px: int = 800, executable_path: str = None, device_scale: int = 2, width_px: int = 1400):
-#     """Render a single map HTML into a PNG using pyppeteer."""
-#     try:
-#         import asyncio
-#         import tempfile
-#         from pyppeteer import launch
-#     except ImportError:
-#         st.error("PNG export requires 'pyppeteer' (pip install pyppeteer).")
-#         return None
+    async def _shot(html_path: str):
+        launch_kwargs = {
+            "args": ["--no-sandbox", "--disable-dev-shm-usage"],
+            "handleSIGINT": False,
+            "handleSIGTERM": False,
+            "handleSIGHUP": False,
+        }
+        if executable_path:
+            launch_kwargs["executablePath"] = executable_path
+        browser = await launch(**launch_kwargs)
+        page = await browser.newPage()
+        await page.setViewport({"width": width_px, "height": height_px, "deviceScaleFactor": device_scale})
+        await page.goto(f"file:///{html_path}", waitUntil="networkidle0")
+        try:
+            await page.waitForSelector(".leaflet-tile-loaded", timeout=8000)
+        except Exception:
+            await asyncio.sleep(2)
+        await asyncio.sleep(2)
+        png = await page.screenshot(fullPage=True)
+        await browser.close()
+        return png
 
-#     map_html = map_obj.get_root().render()
-#     html_doc = f"""
-#     <html>
-#       <head>
-#         <meta charset="utf-8" />
-#         <style>
-#           html, body {{ margin: 0; padding: 0; background: #ffffff; }}
-#           .map-wrap {{ width: {width_px}px; height: {height_px}px; margin: 0; }}
-#           .folium-map, iframe {{ width: 100%; height: 100%; }}
-#           /* Hide Leaflet/leafmap controls for export only */
-#           .leaflet-control-container,
-#           .leaflet-top, .leaflet-bottom,
-#           .leaflet-control,
-#           .leafmap-toolbar,
-#           .leafmap-toolbar-container,
-#           .leafmap-control,
-#           .leafmap-toolbar-left,
-#           .leafmap-toolbar-right,
-#           .leaflet-control-layers {{ display: none !important; }}
-#         </style>
-#       </head>
-#       <body>
-#         <div class="map-wrap">{map_html}</div>
-#       </body>
-#     </html>
-#     """
+    with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
+        f.write(html_doc)
+        html_path = f.name
 
-#     async def _shot(html_path: str):
-#         launch_kwargs = {
-#             "args": ["--no-sandbox", "--disable-dev-shm-usage"],
-#             "handleSIGINT": False,
-#             "handleSIGTERM": False,
-#             "handleSIGHUP": False,
-#         }
-#         if executable_path:
-#             launch_kwargs["executablePath"] = executable_path
-#         browser = await launch(**launch_kwargs)
-#         page = await browser.newPage()
-#         await page.setViewport({"width": width_px, "height": height_px, "deviceScaleFactor": device_scale})
-#         await page.goto(f"file:///{html_path}", waitUntil="networkidle0")
-#         try:
-#             await page.waitForSelector(".leaflet-tile-loaded", timeout=8000)
-#         except Exception:
-#             await asyncio.sleep(2)
-#         await asyncio.sleep(2)
-#         png = await page.screenshot(fullPage=True)
-#         await browser.close()
-#         return png
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        png_bytes = loop.run_until_complete(_shot(html_path))
+    finally:
+        loop.close()
+        try:
+            os.remove(html_path)
+        except OSError:
+            pass
 
-#     with tempfile.NamedTemporaryFile("w", suffix=".html", delete=False, encoding="utf-8") as f:
-#         f.write(html_doc)
-#         html_path = f.name
-
-#     loop = asyncio.new_event_loop()
-#     asyncio.set_event_loop(loop)
-#     try:
-#         png_bytes = loop.run_until_complete(_shot(html_path))
-#     finally:
-#         loop.close()
-#         try:
-#             os.remove(html_path)
-#         except OSError:
-#             pass
-
-#     return png_bytes
+    return png_bytes
 
 
 # --- Prepare data ---
@@ -2110,62 +2096,75 @@ if export_mode:
 map_count = st.session_state.map_count
 cols_per_row = cols_for_count(map_count)
 default_height = calc_map_height(map_count)
-
 map_idx = 0
 rows = (map_count + cols_per_row - 1) // cols_per_row
-
 for _ in range(rows):
     row_cols = st.columns(cols_per_row)
     for col in row_cols:
         if map_idx >= map_count:
             break
-
         with col:
             map_height = st.session_state.get(map_key("map_height", map_idx), default_height)
             m = render_single_map(map_idx, df, geojson_layers)
-
-            # Render map (interactive capture only needed if you rely on view state)
+            png_cache_key = map_key("cached_png", map_idx)
+            prev_height = st.session_state.get(map_key("prev_height", map_idx))
+            if prev_height != map_height:
+                st.session_state.pop(png_cache_key, None)
+            st.session_state[map_key("prev_height", map_idx)] = map_height
+            map_state = None
+            view_changed = False
+            # kmz types not used for input anymore; legend derives from entries in render_single_map
             if export_mode and HAS_ST_FOLIUM:
                 map_state = st_folium(m, height=map_height, width="100%", key=f"map_render_{map_idx}")
                 if map_state:
                     prev_zoom = st.session_state.get(map_key("map_zoom", map_idx))
                     prev_lat = st.session_state.get(map_key("center_lat", map_idx))
                     prev_lon = st.session_state.get(map_key("center_lon", map_idx))
-
                     if map_state.get("zoom") and map_state["zoom"] != prev_zoom:
                         st.session_state[map_key("map_zoom", map_idx)] = map_state["zoom"]
-
+                        view_changed = True
                     if map_state.get("center"):
                         new_lat = map_state["center"]["lat"]
                         new_lon = map_state["center"]["lng"]
                         if new_lat != prev_lat or new_lon != prev_lon:
                             st.session_state[map_key("center_lat", map_idx)] = new_lat
                             st.session_state[map_key("center_lon", map_idx)] = new_lon
+                            view_changed = True
+                if view_changed:
+                    st.session_state.pop(png_cache_key, None)
             else:
                 m.to_streamlit(height=map_height)
-
-            # Map name (fix empty label warning)
+                st.session_state.pop(png_cache_key, None)
             st.text_input(
-                "Map name",
+                "",
                 key=map_key("name", map_idx),
                 value=get_map_name(map_idx),
                 label_visibility="collapsed",
             )
-
-            # Export (HTML)
             if export_mode:
-                html_bytes = export_map_as_html(m)
-                st.download_button(
-                    f"Download HTML ({get_map_name(map_idx)})",
-                    data=html_bytes,
-                    file_name=f"{get_map_name(map_idx).replace(' ', '_').lower()}.html",
-                    mime="text/html",
-                    key=map_key("download_html", map_idx),
-                )
-                st.caption("Open the HTML file in your browser to view the map and screenshot/export it.")
-
+                if not HAS_ST_FOLIUM:
+                    st.info("Export mode requires streamlit-folium to capture the map view.")
+                else:
+                    if st.session_state.get(png_cache_key) is None:
+                        try:
+                            fresh_map = render_single_map(map_idx, df, geojson_layers)
+                            png_bytes = capture_single_map_png(fresh_map, height_px=map_height, executable_path=exe_path)
+                            if png_bytes:
+                                st.session_state[png_cache_key] = png_bytes
+                        except Exception as e:
+                            st.error(f"Could not render {get_map_name(map_idx)}: {e}")
+                    png_bytes = st.session_state.get(png_cache_key)
+                    if png_bytes:
+                        st.download_button(
+                            f"Download PNG ({get_map_name(map_idx)})",
+                            data=png_bytes,
+                            file_name=f"{get_map_name(map_idx).replace(' ', '_').lower()}.png",
+                            mime="image/png",
+                            key=map_key("download_png", map_idx),
+                        )
+                    else:
+                        st.caption("Adjust the map; the current view will be captured for download.")
         map_idx += 1
-
 
 # --- Data preview for all maps ---
 if filtered_dfs:
