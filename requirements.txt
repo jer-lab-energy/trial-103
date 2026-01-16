@@ -8,6 +8,8 @@ fastkml
 folium
 numpy
 Pillow
+pyppeteer
+
 
 
 
