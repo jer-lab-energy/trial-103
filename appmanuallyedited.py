@@ -9,7 +9,6 @@ try:
 except ImportError:
     HAS_ST_FOLIUM = False
 from shapely.geometry import Point
-from label_positions import compute_label_positions
 import base64
 from io import BytesIO
 
