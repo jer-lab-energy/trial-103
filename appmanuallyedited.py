@@ -955,54 +955,58 @@ def safe_read_geojson(uploaded_file):
     # ----------------------------
     # Read file
     # ----------------------------
-try:
-    name = (uploaded_file.name or "").lower()
-
-    if name.endswith(".kmz"):
-        kml_bytes = _extract_kml_bytes_from_kmz(uploaded_file)
-        gdf = _kml_bytes_to_gdf(kml_bytes)
-
-        # Attach styles
-        kml_path = None
-        try:
-            kml_path = write_uploaded_kmz_to_temp_kml(uploaded_file)
-            if kml_path:
-                gdf = attach_kml_styles_to_gdf(gdf, kml_path)
-        except Exception as e:
-            st.warning(f"KMZ styles could not be fully extracted: {e}")
-        finally:
-            if kml_path:
-                try:
-                    import os
-                    os.remove(kml_path)
-                except Exception:
-                    pass
-                
-        elif name.endswith(".kml"):
-            kml_bytes = uploaded_file.getvalue()
+    try:
+        name = (uploaded_file.name or "").lower()
+    
+        if name.endswith(".kmz"):
+            kml_bytes = _extract_kml_bytes_from_kmz(uploaded_file)
             gdf = _kml_bytes_to_gdf(kml_bytes)
-
+    
+            # Attach styles from a temp KML path
+            kml_path = None
             try:
-                # Your style function can work from a KML path. Write to a temp file for styles.
-                import tempfile
-                with tempfile.NamedTemporaryFile(delete=False, suffix=".kml") as tmp:
-                    tmp.write(kml_bytes)
-                    kml_path = tmp.name
-                try:
+                kml_path = write_uploaded_kmz_to_temp_kml(uploaded_file)
+                if kml_path:
                     gdf = attach_kml_styles_to_gdf(gdf, kml_path)
-                finally:
+            except Exception as e:
+                st.warning(f"KMZ styles could not be fully extracted: {e}")
+            finally:
+                if kml_path:
                     try:
                         import os
                         os.remove(kml_path)
                     except Exception:
                         pass
+    
+        elif name.endswith(".kml"):
+            kml_bytes = uploaded_file.getvalue()
+            gdf = _kml_bytes_to_gdf(kml_bytes)
+    
+            # Attach styles from a temp KML path
+            kml_path = None
+            try:
+                import tempfile
+                tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
+                kml_path = tmp.name
+                tmp.close()
+                with open(kml_path, "wb") as f:
+                    f.write(kml_bytes)
+    
+                gdf = attach_kml_styles_to_gdf(gdf, kml_path)
             except Exception as e:
                 st.warning(f"KML styles could not be fully extracted: {e}")
-
+            finally:
+                if kml_path:
+                    try:
+                        import os
+                        os.remove(kml_path)
+                    except Exception:
+                        pass
+    
         else:
             # GeoJSON / JSON and other formats supported by geopandas
             gdf = gpd.read_file(uploaded_file)
-
+    
     except GEOSException as e:
         st.warning(
             f"{uploaded_file.name} contains invalid geometries ({e}). Attempting to read attributes only..."
@@ -1014,10 +1018,11 @@ try:
         except Exception as inner_e:
             st.error(f"Could not load {uploaded_file.name}: {inner_e}")
             return None
-
+    
     except Exception as e:
         st.error(f"Failed to read {uploaded_file.name}: {e}")
         return None
+
 
     # ----------------------------
     # Geometry cleanup / repair
