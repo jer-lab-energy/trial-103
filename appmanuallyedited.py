@@ -879,20 +879,15 @@ def _to_shapely_geom(g):
     return None
 
 
-def write_uploaded_kmz_to_temp_kml(uploaded_file):
-    """KMZ UploadedFile -> extract KML -> write temp .kml path (for style parsing)."""
+def write_uploaded_kmz_to_temp_kmz(uploaded_file):
+    """KMZ UploadedFile -> write temp .kmz path (for style parsing)."""
     import tempfile
     kmz_bytes = uploaded_file.getvalue()
-    with zipfile.ZipFile(BytesIO(kmz_bytes), "r") as z:
-        kml_files = [n for n in z.namelist() if n.lower().endswith(".kml")]
-        if not kml_files:
-            return None
-        kml_name = next((n for n in kml_files if n.lower().endswith("doc.kml")), kml_files[0])
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kmz")
+    with tmp as f:
+        f.write(kmz_bytes)
+    return tmp.name
 
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
-        with tmp as f:
-            f.write(z.read(kml_name))
-        return tmp.name
 
 
 def _kml_bytes_to_gdf(kml_bytes: bytes) -> gpd.GeoDataFrame:
@@ -993,6 +988,15 @@ def safe_read_geojson(uploaded_file):
     except Exception as e:
         st.error(f"Failed to read {uploaded_file.name}: {e}")
         return None
+    # DEBUG: show what we actually loaded BEFORE filters
+    try:
+        st.sidebar.write(f"[DEBUG] {uploaded_file.name}: rows={len(gdf) if gdf is not None else 'None'}")
+        if gdf is not None and "geometry" in gdf.columns:
+            st.sidebar.write(f"[DEBUG] geom nulls={(gdf.geometry.isna()).sum()}")
+            st.sidebar.write(f"[DEBUG] geom types={gdf.geometry.geom_type.value_counts(dropna=False).to_dict()}")
+            st.sidebar.write(f"[DEBUG] crs={gdf.crs}")
+    except Exception:
+        pass
 
     # ---- Geometry cleanup ----
     if gdf is None or gdf.empty or "geometry" not in gdf.columns:
@@ -1013,7 +1017,35 @@ def safe_read_geojson(uploaded_file):
         gdf = gdf[gdf.geometry.notnull()]
         gdf = gdf[~gdf.geometry.is_empty]
 
+        # Normalize geometry collections so we don't drop everything
+        def _explode_geometry_collections(in_gdf):
+            out_rows = []
+            for _, r in in_gdf.iterrows():
+                geom = r.geometry
+                if geom is None:
+                    continue
+        
+                gt = geom.geom_type
+                if gt == "GeometryCollection":
+                    for part in geom.geoms:
+                        rr = r.copy()
+                        rr.geometry = part
+                        out_rows.append(rr)
+                else:
+                    out_rows.append(r)
+            return gpd.GeoDataFrame(out_rows, columns=in_gdf.columns, crs=in_gdf.crs)
+        
+        # If we have GeometryCollections, explode them first
+        try:
+            if (gdf.geometry.geom_type == "GeometryCollection").any():
+                gdf = _explode_geometry_collections(gdf)
+        except Exception:
+            pass
+        
+        # NOW filter to things we can render
         allowed = {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
+        gdf = gdf[gdf.geometry.notnull()]
+        gdf = gdf[~gdf.geometry.is_empty]
         gdf = gdf[gdf.geometry.geom_type.isin(allowed)]
 
         if gdf.crs is None:
@@ -1025,14 +1057,28 @@ def safe_read_geojson(uploaded_file):
             except Exception:
                 pass
 
-        invalid_count = (~gdf.is_valid).sum()
-        if invalid_count > 0:
-            gdf["geometry"] = gdf["geometry"].buffer(0)
+        # Repair invalid POLYGONS only (buffer(0) can break lines/points)
+        try:
+            invalid = ~gdf.is_valid
+            if invalid.any():
+                poly_mask = gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+                fix_mask = invalid & poly_mask
+                if fix_mask.any():
+                    gdf.loc[fix_mask, "geometry"] = gdf.loc[fix_mask, "geometry"].buffer(0)
+        except Exception:
+            pass
 
         gdf = gdf[gdf.is_valid].reset_index(drop=True)
 
     except Exception as e:
         st.warning(f"Could not fully repair geometries in {uploaded_file.name}: {e}")
+        
+    # DEBUG: what survived cleanup
+    try:
+        st.sidebar.write(f"[DEBUG] AFTER CLEANUP {uploaded_file.name}: rows={len(gdf)}")
+        st.sidebar.write(f"[DEBUG] AFTER types={gdf.geometry.geom_type.value_counts().to_dict() if len(gdf) else {}}")
+    except Exception:
+        pass
 
     return gdf
 
