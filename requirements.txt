@@ -5,4 +5,5 @@ leafmap
 streamlit-folium
 shapely
 fastkml
+pyppeteer
 
