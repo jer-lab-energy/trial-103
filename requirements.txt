@@ -1,3 +1,7 @@
 streamlit
 pandas
-openpyxl
+geopandas
+leafmap
+streamlit-folium
+shapely
+
