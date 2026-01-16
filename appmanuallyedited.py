@@ -338,59 +338,66 @@ def extract_kmz_styles(gdf, max_entries=2000, color_override=None):
 
     return entries
 
-from fastkml import kml
-import zipfile
 import base64
 
-def extract_kml_styles_from_kmz(kmz_path):
+from io import BytesIO
+import zipfile
+
+
+from fastkml import kml
+
+def extract_kml_styles_from_kml_path(kml_path):
     """
-    Reads KMZ, parses KML, extracts styles into a dict:
+    Reads a KML file from disk and extracts styles into:
     { style_id : { 'icon_href', 'poly_color', 'line_color', 'line_width' } }
     """
     styles = {}
 
-    with zipfile.ZipFile(kmz_path, "r") as z:
-        # find KML file inside KMZ
-        kml_name = [n for n in z.namelist() if n.lower().endswith(".kml")][0]
-        kml_data = z.read(kml_name).decode("utf-8")
+    try:
+        with open(kml_path, "rb") as f:
+            raw = f.read()
+        kml_text = raw.decode("utf-8", errors="replace")
+    except Exception:
+        return styles
 
     doc = kml.KML()
-    doc.from_string(kml_data)
+    try:
+        doc.from_string(kml_text)
+    except Exception:
+        try:
+            doc.from_string(kml_text.encode("utf-8", errors="replace"))
+        except Exception:
+            return styles
 
     for feature in doc.features():
         for s in feature.styles():
-            sid = s.id
+            sid = getattr(s, "id", None)
+            if not sid:
+                continue
 
             poly_color = None
             line_color = None
             line_width = 2
             icon_href = None
 
-            if s.polystyle:
-                # KML color format: aabbggrr → convert to CSS #rrggbbaa
-                kml_col = s.polystyle.color
-                if kml_col:
-                    rr = kml_col[6:8]
-                    gg = kml_col[4:6]
-                    bb = kml_col[2:4]
-                    aa = kml_col[0:2]
+            if getattr(s, "polystyle", None) and getattr(s.polystyle, "color", None):
+                kml_col = s.polystyle.color  # aabbggrr
+                if isinstance(kml_col, str) and len(kml_col) >= 8:
+                    aa, bb, gg, rr = kml_col[0:2], kml_col[2:4], kml_col[4:6], kml_col[6:8]
                     poly_color = f"#{rr}{gg}{bb}{aa}"
 
-            if s.linestyle:
+            if getattr(s, "linestyle", None) and getattr(s.linestyle, "color", None):
                 kml_col = s.linestyle.color
-                if kml_col:
-                    rr = kml_col[6:8]
-                    gg = kml_col[4:6]
-                    bb = kml_col[2:4]
-                    aa = kml_col[0:2]
+                if isinstance(kml_col, str) and len(kml_col) >= 8:
+                    aa, bb, gg, rr = kml_col[0:2], kml_col[2:4], kml_col[4:6], kml_col[6:8]
                     line_color = f"#{rr}{gg}{bb}{aa}"
-                if s.linestyle.width:
+                if getattr(s.linestyle, "width", None) is not None:
                     line_width = s.linestyle.width
 
-            if s.iconstyle and s.iconstyle.icon and s.iconstyle.icon.href:
+            if getattr(s, "iconstyle", None) and getattr(s.iconstyle, "icon", None) and getattr(s.iconstyle.icon, "href", None):
                 icon_href = s.iconstyle.icon.href
 
-            styles[sid] = {
+            styles[str(sid)] = {
                 "poly_color": poly_color,
                 "line_color": line_color,
                 "line_width": line_width,
@@ -399,28 +406,31 @@ def extract_kml_styles_from_kmz(kmz_path):
 
     return styles
 
-def attach_kml_styles_to_gdf(gdf, kmz_path):
-    styles = extract_kml_styles_from_kmz(kmz_path)
+
+def attach_kml_styles_to_gdf(gdf, kml_path):
+    styles = extract_kml_styles_from_kml_path(kml_path)  # ✅ use KML styles
 
     if "styleUrl" not in gdf.columns:
-        return gdf  # nothing to map
+        return gdf
 
     def apply(row):
-        sid = str(row.get("styleUrl", "")).replace("#", "")
+        raw = str(row.get("styleUrl", "") or "")
+        sid = raw.split("#")[-1]  # handles "#id" and full URLs
         s = styles.get(sid, {})
 
-        if "poly_color" in s:
+        if s.get("poly_color"):
             row["fill"] = s["poly_color"]
-        if "line_color" in s:
+        if s.get("line_color"):
             row["stroke"] = s["line_color"]
-        if "line_width" in s:
+        if s.get("line_width") is not None:
             row["stroke-width"] = s["line_width"]
-        if "icon_href" in s:
+        if s.get("icon_href"):
             row["icon_href"] = s["icon_href"]
 
         return row
 
     return gdf.apply(apply, axis=1)
+
 
 # --- Mini Symbol Generator --- #
 import shapely
@@ -588,7 +598,6 @@ def render_point_marker(map_obj, lat, lon, settings):
             icon=folium.DivIcon(html=html, icon_size=(size, size), icon_anchor=(radius, size)),
         ).add_to(map_obj)
     elif shape == "Custom Image" and settings.get("custom_icon_bytes"):
-        import base64
         b64_icon = base64.b64encode(settings["custom_icon_bytes"]).decode("ascii")
         data_url = f"data:image/png;base64,{b64_icon}"
         icon_px = int(settings.get("custom_icon_size", 24))
@@ -801,21 +810,22 @@ def _read_kmz_to_path(uploaded_file):
     """Extract the first KML inside a KMZ upload to a temp path and return it."""
     import tempfile
     import zipfile
-
+    
     if not uploaded_file or not uploaded_file.name.lower().endswith(".kmz"):
         return None
 
     try:
-        data = uploaded_file.read()
-        zf = zipfile.ZipFile(BytesIO(data))
-        kml_candidates = [n for n in zf.namelist() if n.lower().endswith(".kml")]
-        if not kml_candidates:
-            return None
-        kml_name = kml_candidates[0]
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
-        with tmp as f:
-            f.write(zf.read(kml_name))
-        return tmp.name
+        data = uploaded_file.getvalue()  # ✅ don't consume cursor
+        with zipfile.ZipFile(BytesIO(data)) as zf:
+            kml_candidates = [n for n in zf.namelist() if n.lower().endswith(".kml")]
+            if not kml_candidates:
+                return None
+            kml_name = kml_candidates[0]
+
+            tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".kml")
+            with open(tmp.name, "wb") as f:
+                f.write(zf.read(kml_name))
+            return tmp.name
     except Exception:
         return None
 
