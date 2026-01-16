@@ -8,6 +8,7 @@ fastkml
 folium
 numpy
 Pillow
+openpyxl
 
 
 
