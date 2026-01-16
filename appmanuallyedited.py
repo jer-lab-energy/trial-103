@@ -929,6 +929,9 @@ def safe_read_geojson(uploaded_file):
     """
     name = (uploaded_file.name or "").lower()
 
+    # ----------------------------
+    # Read file
+    # ----------------------------
     try:
         if name.endswith(".kmz"):
             kml_bytes = _extract_kml_bytes_from_kmz(uploaded_file)
@@ -976,7 +979,9 @@ def safe_read_geojson(uploaded_file):
             gdf = gpd.read_file(uploaded_file)
 
     except GEOSException as e:
-        st.warning(f"{uploaded_file.name} contains invalid geometries ({e}). Attempting to read attributes only...")
+        st.warning(
+            f"{uploaded_file.name} contains invalid geometries ({e}). Attempting to read attributes only..."
+        )
         try:
             gdf = gpd.read_file(uploaded_file, ignore_geometry=True)
             if "geometry" in gdf.columns:
@@ -988,6 +993,7 @@ def safe_read_geojson(uploaded_file):
     except Exception as e:
         st.error(f"Failed to read {uploaded_file.name}: {e}")
         return None
+
     # DEBUG: show what we actually loaded BEFORE filters
     try:
         st.sidebar.write(f"[DEBUG] {uploaded_file.name}: rows={len(gdf) if gdf is not None else 'None'}")
@@ -1012,42 +1018,45 @@ def safe_read_geojson(uploaded_file):
         except Exception:
             return geom
 
-    try:
-        gdf["geometry"] = gdf["geometry"].apply(_drop_z)
-        gdf = gdf[gdf.geometry.notnull()]
-        gdf = gdf[~gdf.geometry.is_empty]
-
-        # Normalize geometry collections so we don't drop everything
-        def _explode_geometry_collections(in_gdf):
-            out_rows = []
-            for _, r in in_gdf.iterrows():
-                geom = r.geometry
-                if geom is None:
-                    continue
-        
-                gt = geom.geom_type
-                if gt == "GeometryCollection":
+    def _explode_geometry_collections(in_gdf):
+        out_rows = []
+        for _, r in in_gdf.iterrows():
+            geom = r.geometry
+            if geom is None:
+                continue
+            if getattr(geom, "geom_type", None) == "GeometryCollection":
+                try:
                     for part in geom.geoms:
                         rr = r.copy()
                         rr.geometry = part
                         out_rows.append(rr)
-                else:
+                except Exception:
+                    # if it won't iterate, keep original
                     out_rows.append(r)
-            return gpd.GeoDataFrame(out_rows, columns=in_gdf.columns, crs=in_gdf.crs)
-        
-        # If we have GeometryCollections, explode them first
+            else:
+                out_rows.append(r)
+        return gpd.GeoDataFrame(out_rows, columns=in_gdf.columns, crs=in_gdf.crs)
+
+    try:
+        # 1) drop z
+        gdf["geometry"] = gdf["geometry"].apply(_drop_z)
+
+        # 2) FIX #1: explode GeometryCollections BEFORE dropping empties/types
         try:
             if (gdf.geometry.geom_type == "GeometryCollection").any():
                 gdf = _explode_geometry_collections(gdf)
         except Exception:
             pass
-        
-        # NOW filter to things we can render
-        allowed = {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
+
+        # 3) now drop null/empty
         gdf = gdf[gdf.geometry.notnull()]
         gdf = gdf[~gdf.geometry.is_empty]
+
+        # 4) now filter to supported types
+        allowed = {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
         gdf = gdf[gdf.geometry.geom_type.isin(allowed)]
 
+        # 5) CRS handling
         if gdf.crs is None:
             gdf = gdf.set_crs(epsg=4326, allow_override=True)
         else:
@@ -1057,7 +1066,7 @@ def safe_read_geojson(uploaded_file):
             except Exception:
                 pass
 
-        # Repair invalid POLYGONS only (buffer(0) can break lines/points)
+        # 6) Repair invalid polygons only (buffer(0) can break lines/points)
         try:
             invalid = ~gdf.is_valid
             if invalid.any():
@@ -1068,15 +1077,28 @@ def safe_read_geojson(uploaded_file):
         except Exception:
             pass
 
-        gdf = gdf[gdf.is_valid].reset_index(drop=True)
+        # 7) FIX #2: only is_valid-filter POLYGONS (keep points/lines even if validity is flaky)
+        try:
+            import pandas as pd
+            poly_mask = gdf.geometry.geom_type.isin(["Polygon", "MultiPolygon"])
+            gdf_polys = gdf[poly_mask]
+            gdf_nonpolys = gdf[~poly_mask]
+            if not gdf_polys.empty:
+                gdf_polys = gdf_polys[gdf_polys.is_valid]
+            gdf = pd.concat([gdf_nonpolys, gdf_polys], ignore_index=True)
+        except Exception:
+            gdf = gdf.reset_index(drop=True)
+
+        gdf = gdf.reset_index(drop=True)
 
     except Exception as e:
         st.warning(f"Could not fully repair geometries in {uploaded_file.name}: {e}")
-        
+
     # DEBUG: what survived cleanup
     try:
         st.sidebar.write(f"[DEBUG] AFTER CLEANUP {uploaded_file.name}: rows={len(gdf)}")
-        st.sidebar.write(f"[DEBUG] AFTER types={gdf.geometry.geom_type.value_counts().to_dict() if len(gdf) else {}}")
+        if len(gdf):
+            st.sidebar.write(f"[DEBUG] AFTER types={gdf.geometry.geom_type.value_counts().to_dict()}")
     except Exception:
         pass
 
