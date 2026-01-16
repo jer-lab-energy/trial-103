@@ -810,6 +810,7 @@ from shapely.geometry.base import BaseGeometry
 from shapely.ops import transform as shapely_transform
 from shapely.errors import GEOSException
 
+
 def _extract_kml_bytes_from_kmz(uploaded_kmz) -> bytes:
     """Streamlit UploadedFile (.kmz) -> bytes of the first KML (prefer doc.kml)."""
     kmz_bytes = uploaded_kmz.getvalue()  # IMPORTANT: use getvalue(), not read()
@@ -820,36 +821,53 @@ def _extract_kml_bytes_from_kmz(uploaded_kmz) -> bytes:
         kml_name = next((n for n in kml_files if n.lower().endswith("doc.kml")), kml_files[0])
         return z.read(kml_name)
 
-def _walk_fastkml_features(feat):
+
+def _children_of(obj):
     """
     fastkml compatibility:
-    - some versions use feat.features() (callable)
-    - some versions store children in feat.features (list)
+    - some versions: obj.features is a list
+    - some versions: obj.features() is a generator method
     """
-    children = None
-    if hasattr(feat, "features"):
-        children = getattr(feat, "features")
-        if callable(children):
-            children = children()
+    if not hasattr(obj, "features"):
+        return []
 
-    if children:
-        for sub in children:
-            yield from _walk_fastkml_features(sub)
+    kids = getattr(obj, "features")
+
+    # If it's callable, call it; if it's a list/iterable, return as-is
+    try:
+        return list(kids()) if callable(kids) else list(kids)
+    except TypeError:
+        # If someone still has a list but it got called elsewhere
+        return list(kids)
+    except Exception:
+        return []
+
+
+def _walk_fastkml(obj):
+    """Depth-first walk through nested Documents/Folders down to Placemarks."""
+    kids = _children_of(obj)
+    if kids:
+        for k in kids:
+            yield from _walk_fastkml(k)
     else:
-        yield feat
+        yield obj
+
 
 def _to_shapely_geom(g):
     """Convert fastkml/pygeoif geometries into Shapely geometries."""
     if g is None:
         return None
+
     if isinstance(g, BaseGeometry):
         return g
+
     gi = getattr(g, "__geo_interface__", None)
     if gi:
         try:
             return shapely_shape(gi)
         except Exception:
             return None
+
     wkt = getattr(g, "wkt", None)
     if wkt:
         try:
@@ -857,7 +875,9 @@ def _to_shapely_geom(g):
             return shapely_wkt.loads(wkt)
         except Exception:
             return None
+
     return None
+
 
 def write_uploaded_kmz_to_temp_kml(uploaded_file):
     """KMZ UploadedFile -> extract KML -> write temp .kml path (for style parsing)."""
@@ -874,24 +894,23 @@ def write_uploaded_kmz_to_temp_kml(uploaded_file):
             f.write(z.read(kml_name))
         return tmp.name
 
+
 def _kml_bytes_to_gdf(kml_bytes: bytes) -> gpd.GeoDataFrame:
     """KML bytes -> GeoDataFrame with SHAPELY geometries."""
     doc = fastkml_kml.KML()
+
+    # fastkml versions vary: accept bytes or str
     try:
         doc.from_string(kml_bytes)
     except Exception:
-        # tolerate string input in some fastkml versions
         txt = kml_bytes.decode("utf-8-sig", errors="replace")
         doc.from_string(txt)
+
     records, geoms = [], []
 
-    # top-level containers
-    top_features = doc.features()
-    if callable(top_features):
-        top_features = top_features()
-
-    for top in top_features:
-        for f in _walk_fastkml_features(top):
+    # IMPORTANT: never call doc.features() directly; use _children_of
+    for top in _children_of(doc):
+        for f in _walk_fastkml(top):
             geom_raw = getattr(f, "geometry", None)
             geom = _to_shapely_geom(geom_raw)
             if geom is None:
@@ -906,28 +925,26 @@ def _kml_bytes_to_gdf(kml_bytes: bytes) -> gpd.GeoDataFrame:
 
     return gpd.GeoDataFrame(records, geometry=geoms, crs="EPSG:4326")
 
+
 def safe_read_geojson(uploaded_file):
     """
     Reads GeoJSON/JSON with geopandas.read_file.
     Reads KML/KMZ without GDAL drivers using fastkml, returning SHAPELY geometries.
-    Attaches styles using your existing attach_kml_styles_to_gdf(gdf, kml_path) if available.
+    Attaches styles using attach_kml_styles_to_gdf(gdf, kml_path) if that exists in your app.
     """
     name = (uploaded_file.name or "").lower()
 
-    # ----------------------------
-    # Read file
-    # ----------------------------
     try:
         if name.endswith(".kmz"):
             kml_bytes = _extract_kml_bytes_from_kmz(uploaded_file)
             gdf = _kml_bytes_to_gdf(kml_bytes)
 
-            # attach styles (optional)
+            # Attach styles (optional)
             kml_path = None
             try:
                 kml_path = write_uploaded_kmz_to_temp_kml(uploaded_file)
                 if kml_path:
-                    gdf = attach_kml_styles_to_gdf(gdf, kml_path)  # <- uses your existing function
+                    gdf = attach_kml_styles_to_gdf(gdf, kml_path)
             except Exception as e:
                 st.warning(f"KMZ styles could not be fully extracted: {e}")
             finally:
@@ -942,10 +959,10 @@ def safe_read_geojson(uploaded_file):
             kml_bytes = uploaded_file.getvalue()
             gdf = _kml_bytes_to_gdf(kml_bytes)
 
-            # attach styles (optional)
+            # Attach styles (optional)
             kml_path = None
             try:
-                import tempfile, os
+                import tempfile
                 with tempfile.NamedTemporaryFile(delete=False, suffix=".kml") as tmp:
                     tmp.write(kml_bytes)
                     kml_path = tmp.name
@@ -977,9 +994,7 @@ def safe_read_geojson(uploaded_file):
         st.error(f"Failed to read {uploaded_file.name}: {e}")
         return None
 
-    # ----------------------------
-    # Geometry cleanup / repair
-    # ----------------------------
+    # ---- Geometry cleanup ----
     if gdf is None or gdf.empty or "geometry" not in gdf.columns:
         return gdf
 
@@ -998,7 +1013,7 @@ def safe_read_geojson(uploaded_file):
         gdf = gdf[gdf.geometry.notnull()]
         gdf = gdf[~gdf.geometry.is_empty]
 
-        allowed = {"Point","MultiPoint","LineString","MultiLineString","Polygon","MultiPolygon"}
+        allowed = {"Point", "MultiPoint", "LineString", "MultiLineString", "Polygon", "MultiPolygon"}
         gdf = gdf[gdf.geometry.geom_type.isin(allowed)]
 
         if gdf.crs is None:
@@ -1020,6 +1035,7 @@ def safe_read_geojson(uploaded_file):
         st.warning(f"Could not fully repair geometries in {uploaded_file.name}: {e}")
 
     return gdf
+
 
 
 def preprocess_geojson_layers(files):
