@@ -856,6 +856,38 @@ def _kml_bytes_to_gdf(kml_bytes: bytes) -> gpd.GeoDataFrame:
     gdf = gpd.GeoDataFrame(records, geometry=geoms, crs="EPSG:4326")
     return gdf
 
+from shapely.geometry import shape as shapely_shape
+from shapely.geometry.base import BaseGeometry
+
+def _to_shapely_geom(g):
+    """Convert fastkml/pygeoif geometries into Shapely geometries."""
+    if g is None:
+        return None
+
+    # Already shapely
+    if isinstance(g, BaseGeometry):
+        return g
+
+    # pygeoif + many geometry objects expose __geo_interface__
+    gi = getattr(g, "__geo_interface__", None)
+    if gi:
+        try:
+            return shapely_shape(gi)
+        except Exception:
+            return None
+
+    # Sometimes fastkml gives WKT-ish
+    wkt = getattr(g, "wkt", None)
+    if wkt:
+        try:
+            from shapely import wkt as shapely_wkt
+            return shapely_wkt.loads(wkt)
+        except Exception:
+            return None
+
+    return None
+
+
 def write_uploaded_kmz_to_temp_kml(uploaded_file):
     """KMZ UploadedFile -> extract first KML -> write to temp .kml path"""
     import tempfile
@@ -941,7 +973,8 @@ def _walk_fastkml_features(feat):
 
         for top in doc.features():
             for f in _walk_fastkml_features(top):
-                geom = getattr(f, "geometry", None)
+                geom_raw = getattr(f, "geometry", None)
+                geom = _to_shapely_geom(geom_raw)
                 if geom is None:
                     continue
                 records.append(
@@ -975,6 +1008,9 @@ def _walk_fastkml_features(feat):
         if name.endswith(".kmz"):
             kml_bytes = _extract_kml_bytes_from_kmz(uploaded_file)
             gdf = _kml_bytes_to_gdf(kml_bytes)
+            st.sidebar.write("KMZ raw features:", len(gdf))
+            st.sidebar.write("Geom types:", gdf.geometry.geom_type.value_counts().to_dict())
+
     
             # Attach styles from a temp KML path
             kml_path = None
